@@ -1,0 +1,15 @@
+{
+  "sunrise-massage": {
+    "tenant_id": "sunrise-massage",
+    "business_name": "Sunrise Massage",
+    "cal_api_key": "Y2FsX2xpdmVfNTMwOTJkMWRiODAxNGE3ZTBkNmIyZGYxODI5M2IzY2I=",
+    "cal_team_id": null,
+    "cal_event_types": "Legs Massage:3974289,Shoulder Massage:3974290,Chest Massage:3974291",
+    "cal_default_service": "Legs Massage",
+    "timezone": "America/Winnipeg",
+    "did_numbers": [
+      "+14075648513"
+    ],
+    "obfuscated": true
+  }
+}
