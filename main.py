@@ -358,6 +358,17 @@ async def book_appointment(
     tenant = resolve_tenant(request, x_tenant_id, x_did)
     event_type_id, resolved_name = resolve_event_type(tenant, body.service_name)
 
+    # ---- Option A: Normalize phone to E.164 (+1…) so caller never has to say "+1"
+    phone_raw = (body.invitee_phone or "").strip()
+    digits = "".join(ch for ch in phone_raw if ch.isdigit())
+    if not digits:
+        raise HTTPException(status_code=400, detail="Phone number is required.")
+    # If number already starts with country code 1, keep it; else prepend +1 (Canada/US)
+    if digits.startswith("1"):
+        phone_e164 = f"+{digits}"
+    else:
+        phone_e164 = f"+1{digits}"
+
     # Cal.com booking requires UTC Z time
     start_utc_z = to_utc_z(body.start_time)
     tz = tenant.get("timezone") or DEFAULT_TIMEZONE
@@ -369,7 +380,7 @@ async def book_appointment(
             "name": body.invitee_name,
             "email": body.invitee_email,
             "timeZone": tz,
-            "phoneNumber": body.invitee_phone  # always present now
+            "phoneNumber": phone_e164  # normalized
         },
         "metadata": {
             "source": "vapi-voice",
