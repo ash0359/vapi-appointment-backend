@@ -5,6 +5,7 @@ import base64
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -146,6 +147,7 @@ def upsert_tenant(t: TenantUpsert) -> None:
     })
     TENANTS[key] = stored
     _save_tenants(TENANTS)
+
 
 def get_tenant_by_id(tenant_id: str) -> dict:
     t = TENANTS.get(tenant_id)
@@ -307,6 +309,22 @@ async def list_services(
 # ============================================================
 # VAPI-COMPATIBLE BOOKING ROUTES (Cal.com)
 # ============================================================
+
+
+@app.get("/now")
+async def now_endpoint(request: Request, x_tenant_id: Optional[str] = Header(default=None), x_did: Optional[str] = Header(default=None)):
+    t = resolve_tenant(request, x_tenant_id, x_did)
+    tz = t.get("timezone") or DEFAULT_TIMEZONE
+    dt = datetime.now(ZoneInfo(tz))
+    return {
+        "tenant": t["tenant_id"],
+        "timezone": tz,
+        "iso": dt.isoformat(),
+        "date": dt.strftime("%Y-%m-%d"),
+        "time": dt.strftime("%H:%M"),
+        "weekday": dt.strftime("%A")
+    }
+
 
 @app.post("/check-availability", response_model=AvailabilityResponse)
 async def check_availability(
