@@ -106,6 +106,17 @@ class AppointmentSummary(BaseModel):
 class FindAppointmentsResponse(BaseModel):
     events: List[AppointmentSummary]
 
+class RescheduleRequest(BaseModel):
+    # how to find the existing booking (priority: uid > event_uri > email > phone)
+    uid: Optional[str] = None
+    event_uri: Optional[str] = None
+    invitee_email: Optional[str] = None
+    phone: Optional[str] = None
+
+    # the new time to move to (caller can say local time; we convert)
+    new_start_time: str                    # e.g. "2025-12-03T15:00:00-06:00"
+    service_name: Optional[str] = None     # optional override; if omitted we reuse old service
+
 # ============================================================
 # SIMPLE "DB" (JSON FILE) + HELPERS
 # ============================================================
@@ -309,6 +320,123 @@ async def list_services(
 # ============================================================
 # VAPI-COMPATIBLE BOOKING ROUTES (Cal.com)
 # ============================================================
+
+@app.post("/reschedule-appointment")
+async def reschedule_appointment(
+    body: RescheduleRequest,
+    request: Request,
+    x_tenant_id: Optional[str] = Header(default=None),
+    x_did: Optional[str] = Header(default=None)
+):
+    tenant = resolve_tenant(request, x_tenant_id, x_did)
+    headers = { **auth_headers_for(tenant), "cal-api-version": CAL_BOOKINGS_API_VERSION }
+
+    # ---- 1) Find the target event (reuse the same logic as cancel)
+    booking_uid = (body.uid or "").strip()
+    target_event: Optional[dict] = None
+
+    if not booking_uid and body.event_uri:
+        booking_uid = body.event_uri.rstrip("/").split("/")[-1].strip()
+
+    if not booking_uid and (body.invitee_email or body.phone):
+        all_events = await _fetch_upcoming_for_tenant(tenant)
+
+        # match by email
+        if body.invitee_email and not target_event:
+            email_lower = body.invitee_email.strip().lower()
+            email_matches = []
+            for ev in all_events:
+                for a in (ev.get("attendees") or []):
+                    if (a.get("email") or "").strip().lower() == email_lower:
+                        email_matches.append(ev); break
+            target_event = _soonest(email_matches)
+
+        # match by phone (suffix)
+        if body.phone and not target_event:
+            wanted = "".join(ch for ch in body.phone if ch.isdigit())
+            phone_matches = []
+            for ev in all_events:
+                for a in (ev.get("attendees") or []):
+                    pn = "".join(ch for ch in (a.get("phoneNumber") or "") if ch.isdigit())
+                    if pn and wanted and pn.endswith(wanted):
+                        phone_matches.append(ev); break
+            target_event = _soonest(phone_matches)
+
+        if target_event:
+            booking_uid = str(target_event.get("uid") or target_event.get("id") or "").strip()
+
+    if not booking_uid:
+        raise HTTPException(status_code=404, detail="No matching booking found to reschedule.")
+
+    # If we didn't fetch the full event earlier, fetch a minimal list and pick the one
+    if not target_event:
+        all_events = await _fetch_upcoming_for_tenant(tenant)
+        for ev in all_events:
+            if str(ev.get("uid") or ev.get("id") or "") == booking_uid:
+                target_event = ev; break
+    if not target_event:
+        raise HTTPException(status_code=404, detail="Unable to load booking to reschedule.")
+
+    # ---- 2) Determine eventTypeId (reuse existing service if possible)
+    evtype_obj = target_event.get("eventType") or {}
+    evtype_id = evtype_obj.get("id")
+    if not evtype_id:
+        # fallback: use provided service_name
+        if not body.service_name:
+            raise HTTPException(status_code=400, detail="Cannot infer service from booking; please provide service_name.")
+        evtype_id, _ = resolve_event_type(tenant, body.service_name)
+
+    # ---- 3) Pull attendee info (reuse same customer details)
+    attendees = target_event.get("attendees") or []
+    primary = attendees[0] if attendees else {}
+    invitee_name = primary.get("name") or "Guest"
+    phoneNumber = primary.get("phoneNumber") or ""
+    email = (primary.get("email") or "").lower()
+    if not email:
+        # derive fallback from phone, mirroring your booking behavior
+        digits = "".join(ch for ch in phoneNumber if ch.isdigit())
+        local = digits[-10:] or "unknown"
+        email = f"{local}@nexdirection.local"
+
+    # ---- 4) Cancel the old one
+    async with httpx.AsyncClient(base_url=CAL_API_BASE, headers=headers, timeout=30) as client:
+        r = await client.post(f"/bookings/{booking_uid}/cancel", json={"cancellationReason": "Reschedule to new time"})
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=f"Cal.com cancel error: {r.text}")
+
+    # ---- 5) Book the new one
+    start_utc_z = to_utc_z(body.new_start_time)
+    tz = tenant.get("timezone") or DEFAULT_TIMEZONE
+    # Normalize phone to E.164 if needed
+    digits = "".join(ch for ch in phoneNumber if ch.isdigit())
+    phone_e164 = f"+{digits}" if digits.startswith("1") else f"+1{digits}"
+
+    payload = {
+        "start": start_utc_z,
+        "eventTypeId": int(evtype_id),
+        "attendee": {
+            "name": invitee_name,
+            "email": email,
+            "timeZone": tz,
+            "phoneNumber": phone_e164
+        },
+        "metadata": {"source": "vapi-voice", "rescheduleFrom": booking_uid}
+    }
+
+    async with httpx.AsyncClient(base_url=CAL_API_BASE, headers=headers, timeout=30) as client:
+        r = await client.post("/bookings", json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=f"Cal.com booking error: {r.text}")
+        data = (r.json().get("data") or {})
+
+    new_uid = str(data.get("uid") or data.get("id") or "")
+    return {
+        "success": True,
+        "old_booking_uid": booking_uid,
+        "new_booking_uri": f"{CAL_API_BASE}/bookings/{new_uid}" if new_uid else None,
+        "new_start": data.get("start") or start_utc_z
+    }
+
 
 
 @app.get("/now")
