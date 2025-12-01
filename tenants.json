@@ -1,14 +1,14 @@
 {
-  "sunrise-massage": {
-    "tenant_id": "sunrise-massage",
-    "business_name": "Sunrise Massage",
-    "cal_api_key": "Y2FsX2xpdmVfNTMwOTJkMWRiODAxNGE3ZTBkNmIyZGYxODI5M2IzY2I=",
+  "sunrise-nails": {
+    "tenant_id": "sunrise-nails",
+    "business_name": "Sunrise Nail Salon",
+    "cal_api_key": "Y2FsX2xpdmVfNDRjNDA0MjIzZDgzYjI1NzE2NjZiZTk0Yzg4ZjAyOWU=",
     "cal_team_id": null,
-    "cal_event_types": "Legs Massage:3974289,Shoulder Massage:3974290,Chest Massage:3974291",
-    "cal_default_service": "Legs Massage",
+    "cal_event_types": "Classic Manicure:3974291,Gel Manicure:3974290,Pedicure:4028087,Gel Pedicure:4028088,Acrylic Full Set:3974289,Acrylic Fill:4028086",
+    "cal_default_service": "Classic Manicure",
     "timezone": "America/Winnipeg",
     "did_numbers": [
-      "+14075648513"
+      "+12045550123"
     ],
     "obfuscated": true
   }

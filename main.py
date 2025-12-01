@@ -1,3 +1,4 @@
+# main.py
 import os
 import json
 import base64
@@ -20,8 +21,8 @@ TENANTS_FILE = Path(os.getenv("TENANTS_FILE", "./tenants.json"))
 OBFUSCATE_KEYS = os.getenv("OBFUSCATE_KEYS", "false").lower() in {"1", "true", "yes"}
 
 CAL_API_BASE = "https://api.cal.com/v2"
-CAL_SLOTS_API_VERSION = "2024-09-04"   # required header for /v2/slots
-CAL_BOOKINGS_API_VERSION = "2024-08-13"  # required header for /v2/bookings
+CAL_SLOTS_API_VERSION = "2024-09-04"      # required header for /v2/slots
+CAL_BOOKINGS_API_VERSION = "2024-08-13"   # required header for /v2/bookings
 
 app = FastAPI(title="NexDirection Multi-tenant Cal.com Backend")
 
@@ -65,8 +66,8 @@ class BookAppointmentRequest(BaseModel):
     start_time: str                    # preferred with offset e.g. 2025-12-01T10:00:00-06:00
     end_time: str                      # ignored by Cal.com (kept for Vapi compatibility)
     invitee_name: str
-    invitee_email: str
-    invitee_phone: str                 # REQUIRED now
+    invitee_email: str                 # REQUIRED (kept same as your working code)
+    invitee_phone: str                 # REQUIRED
     service_name: Optional[str] = None
 
 class BookAppointmentResponse(BaseModel):
@@ -75,7 +76,11 @@ class BookAppointmentResponse(BaseModel):
     message: Optional[str] = None
 
 class CancelAppointmentRequest(BaseModel):
-    event_uri: str                     # full URI or uid at the end
+    # New: allow auto-resolution by any of these (priority: uid > event_uri > email/phone)
+    uid: Optional[str] = None
+    event_uri: Optional[str] = None           # full URI or uid at the end
+    invitee_email: Optional[str] = None
+    phone: Optional[str] = None
     cancellation_reason: Optional[str] = None
     cancel_subsequent_bookings: Optional[bool] = None  # for non-seated recurring
     seat_uid: Optional[str] = None                     # for seated bookings
@@ -173,7 +178,7 @@ def resolve_tenant(request: Request, x_tenant_id: Optional[str], x_did: Optional
 
 def service_map_str_to_dict(raw: str) -> Dict[str, str]:
     """
-    'Deep Tissue:111,Relaxation:222' -> {'Deep Tissue':'111', 'Relaxation':'222'}
+    'Deep Tissue:111,Relaxation:222' -> {'Deep Tissue': '111', 'Relaxation': '222'}
     """
     out: Dict[str, str] = {}
     if not raw:
@@ -285,7 +290,11 @@ async def tenants_list():
 # ------------------ PUBLIC: Services for a Tenant ------------------ #
 
 @app.get("/services")
-async def list_services(request: Request, x_tenant_id: Optional[str] = Header(default=None), x_did: Optional[str] = Header(default=None)):
+async def list_services(
+    request: Request,
+    x_tenant_id: Optional[str] = Header(default=None),
+    x_did: Optional[str] = Header(default=None)
+):
     tenant = resolve_tenant(request, x_tenant_id, x_did)
     mapping = service_map_str_to_dict(tenant.get("cal_event_types", ""))
     default_name = tenant.get("cal_default_service") or (list(mapping.keys())[0] if mapping else None)
@@ -358,7 +367,7 @@ async def book_appointment(
     tenant = resolve_tenant(request, x_tenant_id, x_did)
     event_type_id, resolved_name = resolve_event_type(tenant, body.service_name)
 
-    # ---- Option A: Normalize phone to E.164 (+1…) so caller never has to say "+1"
+    # ---- Normalize phone to E.164 (+1…) so caller never has to say "+1"
     phone_raw = (body.invitee_phone or "").strip()
     digits = "".join(ch for ch in phone_raw if ch.isdigit())
     if not digits:
@@ -413,6 +422,52 @@ async def book_appointment(
         message=f"Booked{label} for {start} under {body.invitee_name}."
     )
 
+# ============================================================
+# INTERNAL HELPERS (for auto-cancel)
+# ============================================================
+
+async def _fetch_upcoming_for_tenant(tenant: dict) -> List[dict]:
+    now_utc = datetime.now(timezone.utc)
+    after_start = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    before_end = (now_utc + timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params = {
+        "status": "upcoming,unconfirmed",
+        "afterStart": after_start,
+        "beforeEnd": before_end,
+        "take": 100,
+        "skip": 0,
+    }
+    if tenant.get("cal_team_id"):
+        params["teamId"] = str(tenant["cal_team_id"])
+
+    headers = {
+        **auth_headers_for(tenant),
+        "cal-api-version": CAL_BOOKINGS_API_VERSION,
+    }
+
+    async with httpx.AsyncClient(base_url=CAL_API_BASE, headers=headers, timeout=30) as client:
+        r = await client.get("/bookings", params=params)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=f"Cal.com list error: {r.text}")
+        resp = r.json()
+        return resp.get("data", [])
+
+def _soonest(events: List[dict]) -> Optional[dict]:
+    def _to_dt(e: dict) -> datetime:
+        try:
+            return datetime.fromisoformat((e.get("start") or "").replace("Z", "+00:00"))
+        except Exception:
+            # Put unparsable events at the end
+            return datetime.max.replace(tzinfo=timezone.utc)
+    if not events:
+        return None
+    return sorted(events, key=_to_dt)[0]
+
+# ============================================================
+# CANCELLATION (auto-resolves by uid, event_uri, email, or phone)
+# ============================================================
+
 @app.post("/cancel-appointment", response_model=CancelAppointmentResponse)
 async def cancel_appointment(
     body: CancelAppointmentRequest,
@@ -426,26 +481,68 @@ async def cancel_appointment(
         "cal-api-version": CAL_BOOKINGS_API_VERSION,  # per docs
     }
 
-    booking_uid = body.event_uri.rstrip("/").split("/")[-1]  # treat as UID
+    # 1) Resolve the booking UID
+    booking_uid = (body.uid or "").strip()
+    if not booking_uid and body.event_uri:
+        booking_uid = body.event_uri.rstrip("/").split("/")[-1].strip()
 
+    target_event: Optional[dict] = None
+
+    # 2) If still missing, try resolve by invitee_email (soonest upcoming)
+    if not booking_uid and body.invitee_email:
+        all_events = await _fetch_upcoming_for_tenant(tenant)
+        email_lower = body.invitee_email.strip().lower()
+        email_matches = []
+        for ev in all_events:
+            attendees = ev.get("attendees") or []
+            for a in attendees:
+                if (a.get("email") or "").strip().lower() == email_lower:
+                    email_matches.append(ev)
+                    break
+        target_event = _soonest(email_matches)
+        if target_event:
+            booking_uid = str(target_event.get("uid") or target_event.get("id") or "").strip()
+
+    # 3) If still missing, try resolve by phone suffix (soonest upcoming)
+    if not booking_uid and body.phone:
+        all_events = await _fetch_upcoming_for_tenant(tenant)
+        wanted = "".join(ch for ch in body.phone if ch.isdigit())
+        phone_matches = []
+        for ev in all_events:
+            attendees = ev.get("attendees") or []
+            for a in attendees:
+                pn = (a.get("phoneNumber") or "")
+                pn_norm = "".join(ch for ch in pn if ch.isdigit())
+                if pn_norm and wanted and pn_norm.endswith(wanted):
+                    phone_matches.append(ev)
+                    break
+        target_event = _soonest(phone_matches)
+        if target_event:
+            booking_uid = str(target_event.get("uid") or target_event.get("id") or "").strip()
+
+    if not booking_uid:
+        return CancelAppointmentResponse(success=False, message="No matching booking found to cancel.")
+
+    # 4) Build cancel payload
     cancel_body: Dict[str, object] = {}
-    # Seated booking (attendee) cancellation
     if body.seat_uid:
         cancel_body["seatUid"] = body.seat_uid
-        if body.cancellation_reason:
-            cancel_body["cancellationReason"] = body.cancellation_reason
-    else:
-        if body.cancellation_reason:
-            cancel_body["cancellationReason"] = body.cancellation_reason
-        if body.cancel_subsequent_bookings is not None:
-            cancel_body["cancelSubsequentBookings"] = body.cancel_subsequent_bookings
+    if body.cancellation_reason:
+        cancel_body["cancellationReason"] = body.cancellation_reason
+    if body.cancel_subsequent_bookings is not None:
+        cancel_body["cancelSubsequentBookings"] = body.cancel_subsequent_bookings
 
+    # 5) Call Cal.com
     async with httpx.AsyncClient(base_url=CAL_API_BASE, headers=headers, timeout=30) as client:
         r = await client.post(f"/bookings/{booking_uid}/cancel", json=cancel_body or None)
         if r.status_code >= 400:
             return CancelAppointmentResponse(success=False, message=f"Cal.com cancel error: {r.status_code} {r.text}")
 
     return CancelAppointmentResponse(success=True, message="Appointment cancelled.")
+
+# ============================================================
+# LOOKUPS (email / phone)
+# ============================================================
 
 @app.post("/find-appointments-by-email", response_model=FindAppointmentsResponse)
 async def find_appointments_by_email(
@@ -456,7 +553,6 @@ async def find_appointments_by_email(
 ):
     tenant = resolve_tenant(request, x_tenant_id, x_did)
 
-    # Per docs: attendeeEmail param; add optional teamId and status narrowing
     params = {
         "attendeeEmail": body.invitee_email,
         "status": "upcoming,unconfirmed",
@@ -491,7 +587,6 @@ async def find_appointments_by_email(
             start_time=ev.get("start"),
             end_time=ev.get("end"),
             status=ev.get("status"),
-            # title is top-level; eventType.slug is a fallback if needed
             event_name=(ev.get("title") or (ev.get("eventType") or {}).get("slug"))
         ))
     return FindAppointmentsResponse(events=events)
@@ -526,7 +621,6 @@ async def find_appointments_by_phone(
         "cal-api-version": CAL_BOOKINGS_API_VERSION,
     }
 
-    # Normalize the incoming phone to digits and allow suffix matches (to skip country codes)
     wanted = "".join(ch for ch in body.phone if ch.isdigit())
 
     async with httpx.AsyncClient(base_url=CAL_API_BASE, headers=headers, timeout=30) as client:
